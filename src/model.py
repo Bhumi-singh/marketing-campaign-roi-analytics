@@ -1,69 +1,89 @@
 """
-model.py
-Logistic Regression + XGBoost conversion predictor with SHAP explainability.
+model.py — Conversion prediction: Logistic Regression + XGBoost + SHAP.
 """
-
+ 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import shap
-import joblib
-from pathlib import Path
-from typing import Dict, Tuple
-
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+ 
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
-    roc_auc_score, classification_report,
-    RocCurveDisplay, PrecisionRecallDisplay, confusion_matrix,
-    ConfusionMatrixDisplay
+    classification_report, roc_auc_score, roc_curve,
+    precision_recall_curve, average_precision_score, confusion_matrix
 )
 from xgboost import XGBClassifier
-
-FIG_DIR   = Path("reports/figures")
-MODEL_DIR = Path("models")
-FIG_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-# Features that go into the model (exclude raw text columns & target)
-EXCLUDE = {
-    "y", "y_binary", "age_group", "month", "day_of_week",
-    "job", "marital", "education", "default", "housing",
-    "loan", "contact", "poutcome", "segment_label",
-}
-
-
-def get_feature_cols(df: pd.DataFrame) -> list:
-    return [c for c in df.columns if c not in EXCLUDE and df[c].dtype in [np.float64, np.int64, int, float]]
-
-
-def prepare_data(df: pd.DataFrame, test_size: float = 0.2
-                 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    feat_cols = get_feature_cols(df)
-    X = df[feat_cols].fillna(df[feat_cols].median())
-    y = df["y_binary"]
-    return train_test_split(X, y, test_size=test_size, stratify=y, random_state=42)
-
-
-# ── Logistic Regression ───────────────────────────────────────────────────────
-
-def train_logistic(X_train, y_train) -> Pipeline:
-    pipe = Pipeline([
-        ("scaler", StandardScaler()),
-        ("lr",     LogisticRegression(max_iter=1000, C=0.5, class_weight="balanced",
-                                       solver="lbfgs", random_state=42))
-    ])
-    cv_scores = cross_val_score(pipe, X_train, y_train, cv=5, scoring="roc_auc")
-    print(f"[LogReg] CV AUC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-    pipe.fit(X_train, y_train)
-    return pipe
-
-
-# ── XGBoost ───────────────────────────────────────────────────────────────────
-
-def train_xgboost(X_train, y_train) -> XGBClassifier:
+import shap
+ 
+ 
+# ─── Preprocessing ──────────────────────────────────────────────────────────
+ 
+CATEGORICAL_COLS = ["job", "marital", "education", "default", "housing",
+                    "loan", "contact", "month", "poutcome"]
+ 
+def prepare_features(df: pd.DataFrame) -> tuple:
+    """
+    Encode categoricals, drop non-predictive cols, return X, y, feature_names.
+    """
+    df = df.copy()
+ 
+    # Drop leaky / non-useful columns
+    drop_cols = ["duration"]          # duration is post-hoc leakage
+    df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
+ 
+    # Encode target
+    if df["y"].dtype == object:
+        df["y"] = (df["y"] == "yes").astype(int)
+ 
+    # Label-encode categoricals
+    le = LabelEncoder()
+    for col in CATEGORICAL_COLS:
+        if col in df.columns:
+            df[col] = le.fit_transform(df[col].astype(str))
+ 
+    # day_of_week if present
+    if "day_of_week" in df.columns:
+        df["day_of_week"] = le.fit_transform(df["day_of_week"].astype(str))
+ 
+    X = df.drop(columns=["y"])
+    y = df["y"]
+    return X, y, X.columns.tolist()
+ 
+ 
+def split_data(X, y, test_size=0.2, random_state=42):
+    return train_test_split(X, y, test_size=test_size,
+                            stratify=y, random_state=random_state)
+ 
+ 
+# ─── Logistic Regression ────────────────────────────────────────────────────
+ 
+def train_logistic_regression(X_train, y_train):
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_train)
+    lr = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)
+    lr.fit(X_tr_sc, y_train)
+    return lr, scaler
+ 
+ 
+def evaluate_logistic(lr, scaler, X_test, y_test):
+    X_sc = scaler.transform(X_test)
+    y_pred = lr.predict(X_sc)
+    y_prob = lr.predict_proba(X_sc)[:, 1]
+ 
+    print("=== Logistic Regression ===")
+    print(classification_report(y_test, y_pred, target_names=["No", "Yes"]))
+    print(f"ROC-AUC : {roc_auc_score(y_test, y_prob):.4f}")
+    print(f"Avg Precision: {average_precision_score(y_test, y_prob):.4f}")
+    return y_prob
+ 
+ 
+# ─── XGBoost ────────────────────────────────────────────────────────────────
+ 
+def train_xgboost(X_train, y_train):
     scale_pos = (y_train == 0).sum() / (y_train == 1).sum()
     xgb = XGBClassifier(
         n_estimators=300,
@@ -72,133 +92,153 @@ def train_xgboost(X_train, y_train) -> XGBClassifier:
         subsample=0.8,
         colsample_bytree=0.8,
         scale_pos_weight=scale_pos,
-        eval_metric="auc",
+        use_label_encoder=False,
+        eval_metric="logloss",
         random_state=42,
-        verbosity=0,
+        verbosity=0
     )
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(xgb, X_train, y_train, cv=skf, scoring="roc_auc")
-    print(f"[XGBoost] CV AUC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-    xgb.fit(X_train, y_train)
+    xgb.fit(X_train, y_train,
+            eval_set=[(X_train, y_train)],
+            verbose=False)
     return xgb
-
-
-# ── Evaluation ────────────────────────────────────────────────────────────────
-
-def evaluate_model(model, X_test, y_test, name: str) -> Dict:
-    y_prob = model.predict_proba(X_test)[:, 1]
-    y_pred = (y_prob >= 0.35).astype(int)          # lower threshold due to class imbalance
-
-    auc  = roc_auc_score(y_test, y_prob)
-    rep  = classification_report(y_test, y_pred, output_dict=True)
-
-    print(f"\n── {name} Test Performance ─────────────────────")
-    print(f"  AUC-ROC  : {auc:.4f}")
-    print(classification_report(y_test, y_pred, target_names=["No","Yes"]))
-
-    return {"model": name, "auc": auc, "report": rep, "y_prob": y_prob}
-
-
-def plot_roc_pr(lr_result, xgb_result, y_test):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    for res, color in [(lr_result,"#2563EB"), (xgb_result,"#10B981")]:
-        fpr_tpr = _roc_points(y_test, res["y_prob"])
-        ax1.plot(fpr_tpr[0], fpr_tpr[1], color=color,
-                 label=f"{res['model']} (AUC={res['auc']:.3f})", linewidth=2)
-    ax1.plot([0,1],[0,1],"--",color="#6B7280")
-    ax1.set_title("ROC Curve"); ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR")
-    ax1.legend()
-
-    for res, color in [(lr_result,"#2563EB"), (xgb_result,"#10B981")]:
-        prec, rec = _pr_points(y_test, res["y_prob"])
-        ax2.plot(rec, prec, color=color, label=res["model"], linewidth=2)
-    ax2.set_title("Precision-Recall Curve")
-    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision")
-    ax2.legend()
-
-    plt.suptitle("Model Evaluation", fontsize=14, fontweight="bold")
+ 
+ 
+def evaluate_xgboost(xgb, X_test, y_test):
+    y_pred = xgb.predict(X_test)
+    y_prob = xgb.predict_proba(X_test)[:, 1]
+ 
+    print("=== XGBoost ===")
+    print(classification_report(y_test, y_pred, target_names=["No", "Yes"]))
+    print(f"ROC-AUC : {roc_auc_score(y_test, y_prob):.4f}")
+    print(f"Avg Precision: {average_precision_score(y_test, y_prob):.4f}")
+    return y_prob
+ 
+ 
+# ─── Visualisation ───────────────────────────────────────────────────────────
+ 
+def plot_roc_curves(y_test, lr_prob, xgb_prob, save_path=None):
+    plt.figure(figsize=(7, 5))
+    for prob, label in [(lr_prob, "Logistic Regression"), (xgb_prob, "XGBoost")]:
+        fpr, tpr, _ = roc_curve(y_test, prob)
+        auc = roc_auc_score(y_test, prob)
+        plt.plot(fpr, tpr, label=f"{label} (AUC={auc:.3f})")
+    plt.plot([0, 1], [0, 1], "k--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve Comparison")
+    plt.legend()
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "roc_pr_curves.png", dpi=150, bbox_inches="tight")
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-
-
-def _roc_points(y_true, y_prob):
-    from sklearn.metrics import roc_curve
-    fpr, tpr, _ = roc_curve(y_true, y_prob)
-    return fpr, tpr
-
-
-def _pr_points(y_true, y_prob):
-    from sklearn.metrics import precision_recall_curve
-    prec, rec, _ = precision_recall_curve(y_true, y_prob)
-    return prec, rec
-
-
-# ── SHAP ──────────────────────────────────────────────────────────────────────
-
-def explain_xgboost(xgb_model: XGBClassifier, X_test: pd.DataFrame, n_samples: int = 500):
-    X_sample = X_test.sample(min(n_samples, len(X_test)), random_state=42)
-    explainer = shap.TreeExplainer(xgb_model)
-    shap_vals = explainer.shap_values(X_sample)
-
-    # Summary beeswarm
-    fig, ax = plt.subplots(figsize=(10, 7))
-    shap.summary_plot(shap_vals, X_sample, show=False)
-    plt.title("SHAP Feature Importance (XGBoost)", fontsize=13, fontweight="bold")
+ 
+ 
+def plot_precision_recall(y_test, lr_prob, xgb_prob, save_path=None):
+    plt.figure(figsize=(7, 5))
+    for prob, label in [(lr_prob, "Logistic Regression"), (xgb_prob, "XGBoost")]:
+        prec, rec, _ = precision_recall_curve(y_test, prob)
+        ap = average_precision_score(y_test, prob)
+        plt.plot(rec, prec, label=f"{label} (AP={ap:.3f})")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.legend()
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "shap_summary.png", dpi=150, bbox_inches="tight")
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-
-    # Bar chart top-10
-    fig2, ax2 = plt.subplots(figsize=(9, 5))
-    shap.summary_plot(shap_vals, X_sample, plot_type="bar", show=False, max_display=10)
-    plt.title("Top 10 SHAP Features", fontsize=12, fontweight="bold")
+ 
+ 
+def plot_confusion_matrix(y_test, y_pred, title="Confusion Matrix", save_path=None):
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=["No", "Yes"], yticklabels=["No", "Yes"])
+    plt.ylabel("Actual")
+    plt.xlabel("Predicted")
+    plt.title(title)
     plt.tight_layout()
-    fig2.savefig(FIG_DIR / "shap_bar.png", dpi=150, bbox_inches="tight")
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-
-    return explainer, shap_vals
-
-
-# ── Scored list ───────────────────────────────────────────────────────────────
-
-def score_customers(df: pd.DataFrame, xgb_model: XGBClassifier) -> pd.DataFrame:
-    feat_cols = get_feature_cols(df)
-    X = df[feat_cols].fillna(df[feat_cols].median())
-    df = df.copy()
-    df["conversion_probability"] = xgb_model.predict_proba(X)[:, 1]
-    df["priority_rank"]          = df["conversion_probability"].rank(ascending=False).astype(int)
-    return df.sort_values("conversion_probability", ascending=False)
-
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-
-def run_modeling(df: pd.DataFrame) -> Dict:
-    X_train, X_test, y_train, y_test = prepare_data(df)
-    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
-    print(f"Class balance (train): {y_train.mean():.2%} positive")
-
-    lr_model  = train_logistic(X_train, y_train)
-    xgb_model = train_xgboost(X_train, y_train)
-
-    lr_result  = evaluate_model(lr_model,  X_test, y_test, "Logistic Regression")
-    xgb_result = evaluate_model(xgb_model, X_test, y_test, "XGBoost")
-
-    plot_roc_pr(lr_result, xgb_result, y_test)
-    explain_xgboost(xgb_model, X_test)
-
-    # Save best model
-    joblib.dump(xgb_model, MODEL_DIR / "xgboost_model.pkl")
-    joblib.dump(lr_model,  MODEL_DIR / "logreg_model.pkl")
-    print(f"\n✅ Models saved to {MODEL_DIR}/")
-
-    return {
-        "lr_model"     : lr_model,
-        "xgb_model"    : xgb_model,
-        "lr_result"    : lr_result,
-        "xgb_result"   : xgb_result,
-        "feature_cols" : get_feature_cols(df),
-        "X_test"       : X_test,
-        "y_test"       : y_test,
-    }
+ 
+ 
+def plot_xgb_feature_importance(xgb, feature_names, top_n=15, save_path=None):
+    imp = pd.Series(xgb.feature_importances_, index=feature_names)
+    imp = imp.nlargest(top_n).sort_values()
+    plt.figure(figsize=(8, 6))
+    imp.plot(kind="barh", color="steelblue")
+    plt.title(f"XGBoost Top {top_n} Feature Importances")
+    plt.xlabel("Importance Score")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+ 
+ 
+# ─── SHAP Analysis ──────────────────────────────────────────────────────────
+ 
+def compute_shap_values(xgb, X_test):
+    """Return SHAP explainer and values for the XGBoost model."""
+    explainer = shap.TreeExplainer(xgb)
+    shap_values = explainer.shap_values(X_test)
+    return explainer, shap_values
+ 
+ 
+def plot_shap_summary(shap_values, X_test, save_path=None):
+    plt.figure()
+    shap.summary_plot(shap_values, X_test, show=False)
+    plt.title("SHAP Summary — Feature Impact on Conversion")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+ 
+ 
+def plot_shap_bar(shap_values, X_test, save_path=None):
+    plt.figure()
+    shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+    plt.title("Mean |SHAP| — Feature Importance")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+ 
+ 
+def plot_shap_waterfall(explainer, X_test, idx=0, save_path=None):
+    """Waterfall plot for a single prediction."""
+    shap.plots.waterfall(explainer(X_test)[idx], show=False)
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+ 
+ 
+# ─── Scored Customer List ────────────────────────────────────────────────────
+ 
+def score_customers(df_original: pd.DataFrame, xgb, X, feature_names: list) -> pd.DataFrame:
+    """
+    Return original dataframe enriched with conversion probability scores,
+    ranked highest-first.
+    """
+    probs = xgb.predict_proba(X[feature_names])[:, 1]
+    df_scored = df_original.copy()
+    df_scored["conversion_probability"] = probs
+    df_scored["score_rank"] = df_scored["conversion_probability"].rank(
+        ascending=False, method="first"
+    ).astype(int)
+    return df_scored.sort_values("conversion_probability", ascending=False)
+ 
+ 
+def save_scored_list(df_scored: pd.DataFrame, path="data/processed/scored_customers.csv"):
+    df_scored.to_csv(path, index=False)
+    print(f"Scored customer list saved → {path}  ({len(df_scored):,} rows)")
+ 
+ 
+# ─── Cross-Validation ────────────────────────────────────────────────────────
+ 
+def cross_validate_model(model, X, y, cv=5, scoring="roc_auc"):
+    skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+    scores = cross_val_score(model, X, y, cv=skf, scoring=scoring)
+    print(f"Cross-Val {scoring}: {scores.mean():.4f} ± {scores.std():.4f}")
+    return scores
+ 

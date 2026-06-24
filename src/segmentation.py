@@ -1,168 +1,232 @@
 """
-segmentation.py
-K-Means customer segmentation on the bank marketing dataset.
+segmentation.py — Customer segmentation using K-Means clustering.
 """
-
+ 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
-from typing import Dict, Tuple
-
-FIG_DIR = Path("reports/figures")
-FIG_DIR.mkdir(parents=True, exist_ok=True)
-
-# Features used for clustering
-SEG_FEATURES = [
-    "age",
-    "duration",
-    "campaign",
-    "previous",
-    "emp.var.rate",
-    "cons.price.idx",
-    "cons.conf.idx",
-    "euribor3m",
-    "nr.employed",
-    "was_previously_contacted",
-    "month_num",
-]
-
-SEGMENT_LABELS = {
-    0: "High-Value Responders",
-    1: "At-Risk / Low-Engagement",
-    2: "Price-Sensitive Fence-Sitters",
-    3: "Loyal Previously-Contacted",
-}
-
-
-def build_segment_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Select and clean feature matrix for clustering."""
-    feat_cols = [c for c in SEG_FEATURES if c in df.columns]
-    X = df[feat_cols].copy()
-    X = X.fillna(X.median())
-    return X
-
-
-def find_optimal_k(X_scaled: np.ndarray, k_range=range(2, 9)) -> int:
-    """Elbow + silhouette to pick k."""
-    inertias, silhouettes = [], []
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+ 
+ 
+# ─── Feature Engineering ────────────────────────────────────────────────────
+ 
+def engineer_segment_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create features suitable for customer segmentation."""
+    df = df.copy()
+ 
+    # Age bands
+    df["age_group"] = pd.cut(
+        df["age"],
+        bins=[0, 30, 40, 50, 60, 100],
+        labels=["<30", "30-40", "40-50", "50-60", "60+"]
+    )
+ 
+    # Balance bands
+    df["balance_band"] = pd.cut(
+        df["balance"],
+        bins=[-10000, 0, 500, 2000, 10000, 200000],
+        labels=["negative", "low", "medium", "high", "very_high"]
+    )
+ 
+    # Contact recency proxy (pdays: -1 means never contacted)
+    df["previously_contacted"] = (df["pdays"] != -1).astype(int)
+    df["recency_days"] = df["pdays"].replace(-1, 999)  # 999 = never
+ 
+    # Frequency of contact in this campaign
+    df["high_contact"] = (df["campaign"] > df["campaign"].median()).astype(int)
+ 
+    return df
+ 
+ 
+def select_clustering_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Select and encode numeric features for clustering."""
+    features = [
+        "age", "balance", "duration", "campaign",
+        "pdays", "previous", "previously_contacted", "high_contact"
+    ]
+    return df[features].fillna(0)
+ 
+ 
+# ─── Optimal K Selection ────────────────────────────────────────────────────
+ 
+def find_optimal_k(X_scaled: np.ndarray, k_range=range(2, 9)) -> dict:
+    """Compute inertia and silhouette scores for each k."""
+    results = {"k": [], "inertia": [], "silhouette": []}
     for k in k_range:
         km = KMeans(n_clusters=k, random_state=42, n_init=10)
         labels = km.fit_predict(X_scaled)
-        inertias.append(km.inertia_)
-        silhouettes.append(silhouette_score(X_scaled, labels))
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    ax1.plot(list(k_range), inertias, "o-", color="#2563EB")
-    ax1.set_title("Elbow Method"); ax1.set_xlabel("k"); ax1.set_ylabel("Inertia")
-
-    ax2.plot(list(k_range), silhouettes, "o-", color="#10B981")
-    ax2.set_title("Silhouette Score"); ax2.set_xlabel("k"); ax2.set_ylabel("Score")
-
-    plt.suptitle("Optimal k Selection", fontsize=13, fontweight="bold")
+        results["k"].append(k)
+        results["inertia"].append(km.inertia_)
+        results["silhouette"].append(silhouette_score(X_scaled, labels))
+    return results
+ 
+ 
+def plot_elbow_silhouette(results: dict, save_path: str = None):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+ 
+    axes[0].plot(results["k"], results["inertia"], "bo-")
+    axes[0].set_title("Elbow Method — Inertia vs K")
+    axes[0].set_xlabel("Number of Clusters (k)")
+    axes[0].set_ylabel("Inertia")
+ 
+    axes[1].plot(results["k"], results["silhouette"], "rs-")
+    axes[1].set_title("Silhouette Score vs K")
+    axes[1].set_xlabel("Number of Clusters (k)")
+    axes[1].set_ylabel("Silhouette Score")
+ 
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "optimal_k.png", dpi=150, bbox_inches="tight")
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-
-    best_k = list(k_range)[np.argmax(silhouettes)]
-    print(f"Best k by silhouette: {best_k}  (score={max(silhouettes):.3f})")
-    return best_k
-
-
-def fit_kmeans(df: pd.DataFrame, k: int = 4) -> Tuple[pd.DataFrame, KMeans, StandardScaler]:
-    X    = build_segment_features(df)
+ 
+ 
+# ─── Fit K-Means ────────────────────────────────────────────────────────────
+ 
+def fit_kmeans(df: pd.DataFrame, k: int = 4) -> tuple:
+    """
+    Fit K-Means on engineered features.
+    Returns: (df_with_segment, scaler, kmeans_model, feature_matrix)
+    """
+    df = engineer_segment_features(df)
+    X = select_clustering_features(df)
+ 
     scaler = StandardScaler()
-    X_sc = scaler.fit_transform(X)
-
-    km = KMeans(n_clusters=k, random_state=42, n_init=10, max_iter=300)
-    df = df.copy()
-    df["segment"]       = km.fit_predict(X_sc)
-    df["segment_label"] = df["segment"].map(SEGMENT_LABELS)
-
-    sil = silhouette_score(X_sc, df["segment"])
-    print(f"[KMeans k={k}] Silhouette = {sil:.3f}")
-    return df, km, scaler
-
-
-def segment_profiles(df: pd.DataFrame) -> pd.DataFrame:
-    profile_cols = [
-        "age", "duration", "campaign", "previous",
-        "emp.var.rate", "euribor3m", "y_binary",
-    ]
-    profile = (
-        df.groupby("segment_label")[profile_cols]
-        .agg(["mean", "std"])
-        .round(2)
-    )
-    # Flat columns
-    profile.columns = ["_".join(c) for c in profile.columns]
-    profile["n"] = df.groupby("segment_label").size()
-    profile["conversion_rate"] = df.groupby("segment_label")["y_binary"].mean().round(4)
-    profile = profile.sort_values("conversion_rate", ascending=False)
-    print("\nSegment Profiles:")
-    print(profile[["n","conversion_rate","age_mean","duration_mean","campaign_mean"]].to_string())
+    X_scaled = scaler.fit_transform(X)
+ 
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    df["segment"] = km.fit_predict(X_scaled)
+ 
+    return df, scaler, km, X_scaled
+ 
+ 
+# ─── Segment Profiling ───────────────────────────────────────────────────────
+ 
+SEGMENT_LABELS = {
+    # Will be overwritten after inspecting cluster profiles
+    0: "Segment 0",
+    1: "Segment 1",
+    2: "Segment 2",
+    3: "Segment 3",
+}
+ 
+def profile_segments(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Generate a summary profile for each segment.
+    Requires 'segment' and 'y' columns (y = converted).
+    """
+    profile = df.groupby("segment").agg(
+        count=("segment", "count"),
+        avg_age=("age", "mean"),
+        avg_balance=("balance", "mean"),
+        avg_duration=("duration", "mean"),
+        avg_campaign=("campaign", "mean"),
+        conversion_rate=("y", "mean"),
+    ).reset_index()
+ 
+    profile["conversion_rate_pct"] = (profile["conversion_rate"] * 100).round(2)
+    profile["avg_age"] = profile["avg_age"].round(1)
+    profile["avg_balance"] = profile["avg_balance"].round(0)
+    profile["avg_duration"] = profile["avg_duration"].round(0)
     return profile
-
-
-def plot_segment_radar(df: pd.DataFrame):
-    """Radar chart comparing segments across key features."""
-    from matplotlib.patches import FancyArrowPatch
-    features = ["age","duration","campaign","previous","euribor3m"]
-    seg_means = df.groupby("segment_label")[features].mean()
-
-    # Normalise 0-1 per feature
-    seg_norm = (seg_means - seg_means.min()) / (seg_means.max() - seg_means.min() + 1e-9)
-
-    angles = np.linspace(0, 2 * np.pi, len(features), endpoint=False).tolist()
-    angles += angles[:1]
-
-    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
-    colors = ["#2563EB","#EF4444","#F59E0B","#10B981"]
-
-    for (label, row), color in zip(seg_norm.iterrows(), colors):
-        vals = row.tolist() + row.tolist()[:1]
-        ax.plot(angles, vals, "o-", linewidth=2, color=color, label=label)
-        ax.fill(angles, vals, alpha=0.1, color=color)
-
-    ax.set_thetagrids(np.degrees(angles[:-1]), features)
-    ax.set_title("Segment Radar Chart", size=14, fontweight="bold", y=1.1)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.15), fontsize=9)
+ 
+ 
+def label_segments(df: pd.DataFrame, profile: pd.DataFrame) -> pd.DataFrame:
+    """
+    Auto-label segments based on conversion rate and balance rank.
+    High conversion + high balance → 'High-Value Responders'
+    Low conversion + low balance  → 'Price-Sensitive / Hard to Convert'
+    High balance, low conversion  → 'Dormant High-Balance'
+    Low balance, high contact     → 'Over-Contacted / Fatigued'
+    """
+    profile = profile.copy().sort_values("conversion_rate_pct", ascending=False)
+    labels_map = {}
+    preset = [
+        "High-Value Responders",
+        "Moderate Potential",
+        "Dormant High-Balance",
+        "Hard-to-Convert",
+    ]
+    for i, (_, row) in enumerate(profile.iterrows()):
+        labels_map[int(row["segment"])] = preset[i] if i < len(preset) else f"Segment {i}"
+ 
+    df["segment_label"] = df["segment"].map(labels_map)
+    return df, labels_map
+ 
+ 
+# ─── Visualisation ───────────────────────────────────────────────────────────
+ 
+def plot_segment_profiles(profile: pd.DataFrame, labels_map: dict, save_path: str = None):
+    profile = profile.copy()
+    profile["label"] = profile["segment"].map(labels_map)
+ 
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    colors = sns.color_palette("Set2", len(profile))
+ 
+    # Conversion rate
+    axes[0].bar(profile["label"], profile["conversion_rate_pct"], color=colors)
+    axes[0].set_title("Conversion Rate by Segment (%)")
+    axes[0].set_ylabel("Conversion Rate (%)")
+    axes[0].tick_params(axis="x", rotation=30)
+ 
+    # Average Balance
+    axes[1].bar(profile["label"], profile["avg_balance"], color=colors)
+    axes[1].set_title("Average Balance by Segment (€)")
+    axes[1].set_ylabel("Average Balance")
+    axes[1].tick_params(axis="x", rotation=30)
+ 
+    # Segment size
+    axes[2].pie(
+        profile["count"],
+        labels=profile["label"],
+        autopct="%1.1f%%",
+        colors=colors,
+        startangle=90
+    )
+    axes[2].set_title("Segment Size Distribution")
+ 
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "segment_radar.png", dpi=150, bbox_inches="tight")
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-
-
-def plot_segment_conversion(df: pd.DataFrame):
-    rates = df.groupby("segment_label")["y_binary"].mean().sort_values(ascending=True) * 100
-    colors = ["#EF4444","#F59E0B","#6366F1","#10B981"]
-
-    fig, ax = plt.subplots(figsize=(9, 4))
-    bars = ax.barh(rates.index, rates.values, color=colors)
-    ax.bar_label(bars, fmt="%.1f%%", padding=5, fontweight="bold")
-    ax.set_xlabel("Conversion Rate (%)")
-    ax.set_title("Conversion Rate by Customer Segment", fontsize=13, fontweight="bold")
+ 
+ 
+def plot_segment_heatmap(profile: pd.DataFrame, labels_map: dict, save_path: str = None):
+    profile = profile.copy()
+    profile["label"] = profile["segment"].map(labels_map)
+    heat_cols = ["avg_age", "avg_balance", "avg_duration", "avg_campaign", "conversion_rate_pct"]
+    heat_data = profile.set_index("label")[heat_cols]
+    heat_norm = (heat_data - heat_data.min()) / (heat_data.max() - heat_data.min())
+ 
+    plt.figure(figsize=(10, 4))
+    sns.heatmap(heat_norm, annot=heat_data.round(1), fmt="g", cmap="YlOrRd", linewidths=0.5)
+    plt.title("Segment Feature Heatmap (Normalised)")
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "segment_conversion.png", dpi=150, bbox_inches="tight")
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
-
-
-def run_segmentation(df: pd.DataFrame, k: int = 4) -> pd.DataFrame:
-    X      = build_segment_features(df)
-    scaler = StandardScaler()
-    X_sc   = scaler.fit_transform(X)
-
-    find_optimal_k(X_sc)
-    df_seg, km, _ = fit_kmeans(df, k=k)
-    profiles       = segment_profiles(df_seg)
-    plot_segment_radar(df_seg)
-    plot_segment_conversion(df_seg)
-
-    out = "data/processed/segments.csv"
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    df_seg.to_csv(out, index=False)
-    print(f"\n✅ Segmented data saved → {out}")
-    return df_seg
+ 
+ 
+def plot_conversion_by_segment_job(df: pd.DataFrame, save_path: str = None):
+    ct = df.groupby(["segment_label", "job"])["y"].mean().reset_index()
+    ct.columns = ["Segment", "Job", "Conversion Rate"]
+    pivot = ct.pivot(index="Job", columns="Segment", values="Conversion Rate")
+ 
+    plt.figure(figsize=(14, 6))
+    sns.heatmap(pivot, annot=True, fmt=".2f", cmap="Blues", linewidths=0.3)
+    plt.title("Conversion Rate by Segment × Job")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+ 
+ 
+# ─── Save Segments ───────────────────────────────────────────────────────────
+ 
+def save_segments(df: pd.DataFrame, path: str = "data/processed/segments.csv"):
+    df.to_csv(path, index=False)
+    print(f"Segments saved → {path}  ({len(df):,} rows)")
