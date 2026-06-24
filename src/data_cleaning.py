@@ -7,8 +7,8 @@ import pandas as pd
 import numpy as np
 import os
 
-RAW_PATH = "data/raw/bank-additional-full.csv"
-OUT_PATH = "data/processed/cleaned_data.csv"
+RAW_PATH = "../data/raw/bank-additional/bank-additional/bank-additional-full.csv"
+OUT_PATH = "../data/processed/cleaned_data.csv"
 
 
 def load_raw(path: str = RAW_PATH) -> pd.DataFrame:
