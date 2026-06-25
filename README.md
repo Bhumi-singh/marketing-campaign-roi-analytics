@@ -182,7 +182,6 @@ See [`reports/findings.md`](reports/findings.md) for the full business-facing an
 
 ## 👩‍💻 Author
 
-**Bhumi Singh** — Data Analyst  
-B.Tech Electronics & Communication Engineering, RCOEM Nagpur (CGPA: 8.67)  
+**Bhumi Singh**
 [GitHub](https://github.com/Bhumi-singh) · [LinkedIn](https://linkedin.com/in/bhumi-singh)  
 singhbhumi0927@gmail.com
